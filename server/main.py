@@ -2,9 +2,25 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import date, timedelta
+import hashlib
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
+
+# In-memory restocking orders — survive page refresh, lost on server restart
+restocking_orders: list[dict] = []
+
+# Most demand-forecast SKUs don't exist in inventory.json, so cost lookup
+# falls back to the median inventory unit_cost when the join misses.
+FALLBACK_UNIT_COST = 34.50
+
+
+def lead_time_for_sku(sku: str) -> int:
+    """Deterministic mock lead time in days (3-14). md5 instead of built-in
+    hash() so values are stable across server restarts (hash() is salted)."""
+    h = int(hashlib.md5(sku.encode()).hexdigest(), 16)
+    return (h % 12) + 3
 
 # Quarter mapping for date filtering
 QUARTER_MAP = {
@@ -119,6 +135,43 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+
+class RestockingRecommendation(BaseModel):
+    sku: str
+    name: str
+    trend: str
+    current_demand: int
+    forecasted_demand: int
+    suggested_quantity: int
+    unit_cost: float
+    line_cost: float
+    lead_time_days: int
+    cost_source: str  # "inventory" | "fallback"
+
+
+class RestockingOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+
+
+class CreateRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderItem]
+    budget: float
+
+
+class RestockingOrder(BaseModel):
+    id: str
+    order_number: str
+    items: List[dict]
+    status: str
+    order_date: str
+    expected_delivery: str
+    lead_time_days: int
+    total_value: float
+    budget: float
 
 # API endpoints
 @app.get("/")
@@ -303,6 +356,78 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking/recommendations", response_model=List[RestockingRecommendation])
+def get_restocking_recommendations():
+    """Restocking recommendations from demand forecasts, enriched with cost + lead time.
+
+    Sorted by priority: increasing trend first, then largest forecast gap.
+    """
+    inv_by_sku = {i["sku"]: i for i in inventory_items}
+    recs = []
+    for f in demand_forecasts:
+        gap = max(0, f["forecasted_demand"] - f["current_demand"])
+        if gap == 0:
+            continue
+        inv = inv_by_sku.get(f["item_sku"])
+        unit_cost = inv["unit_cost"] if inv else FALLBACK_UNIT_COST
+        recs.append({
+            "sku": f["item_sku"],
+            "name": f["item_name"],
+            "trend": f["trend"],
+            "current_demand": f["current_demand"],
+            "forecasted_demand": f["forecasted_demand"],
+            "suggested_quantity": gap,
+            "unit_cost": round(unit_cost, 2),
+            "line_cost": round(gap * unit_cost, 2),
+            "lead_time_days": lead_time_for_sku(f["item_sku"]),
+            "cost_source": "inventory" if inv else "fallback",
+        })
+    trend_rank = {"increasing": 0, "stable": 1, "decreasing": 2}
+    recs.sort(key=lambda r: (trend_rank.get(r["trend"], 3), -r["suggested_quantity"]))
+    return recs
+
+
+@app.post("/api/restocking/orders", response_model=RestockingOrder, status_code=201)
+def create_restocking_order(req: CreateRestockingOrderRequest):
+    """Create a restocking order from selected items within budget."""
+    if not req.items:
+        raise HTTPException(status_code=400, detail="At least one item is required")
+
+    total = round(sum(i.quantity * i.unit_cost for i in req.items), 2)
+    if total > req.budget:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order total ${total} exceeds budget ${req.budget}"
+        )
+
+    max_lead = max(lead_time_for_sku(i.sku) for i in req.items)
+    today = date.today()
+    seq = len(restocking_orders) + 1
+    order = {
+        "id": f"rso-{seq}",
+        "order_number": f"RSO-{today.year}-{seq:04d}",
+        # item shape matches Orders.vue's items dropdown ({sku, name, quantity, unit_price})
+        "items": [
+            {"sku": i.sku, "name": i.name, "quantity": i.quantity, "unit_price": i.unit_cost}
+            for i in req.items
+        ],
+        "status": "Submitted",
+        "order_date": today.isoformat(),
+        "expected_delivery": (today + timedelta(days=max_lead)).isoformat(),
+        "lead_time_days": max_lead,
+        "total_value": total,
+        "budget": req.budget,
+    }
+    restocking_orders.append(order)
+    return order
+
+
+@app.get("/api/restocking/orders", response_model=List[RestockingOrder])
+def get_restocking_orders():
+    """List submitted restocking orders (in-memory)."""
+    return restocking_orders
+
 
 if __name__ == "__main__":
     import uvicorn

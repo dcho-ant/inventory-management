@@ -27,6 +27,48 @@
         </div>
       </div>
 
+      <div v-if="restockingOrders.length" class="card">
+        <div class="card-header">
+          <h3 class="card-title">{{ t('orders.restockingOrders') }} ({{ restockingOrders.length }})</h3>
+        </div>
+        <div class="table-container">
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th>{{ t('orders.table.orderNumber') }}</th>
+                <th>{{ t('orders.table.items') }}</th>
+                <th>{{ t('orders.table.status') }}</th>
+                <th>{{ t('orders.table.orderDate') }}</th>
+                <th>{{ t('restocking.leadTime') }}</th>
+                <th>{{ t('orders.table.expectedDelivery') }}</th>
+                <th>{{ t('orders.table.totalValue') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="o in restockingOrders" :key="o.id">
+                <td><strong>{{ o.order_number }}</strong></td>
+                <td>
+                  <details class="items-details">
+                    <summary class="items-summary">{{ t('orders.itemsCount', { count: o.items.length }) }}</summary>
+                    <div class="items-dropdown">
+                      <div v-for="it in o.items" :key="it.sku" class="item-entry">
+                        <span class="item-name">{{ it.name }}</span>
+                        <span class="item-meta">{{ t('orders.quantity') }}: {{ it.quantity }} @ {{ currencySymbol }}{{ it.unit_price }}</span>
+                      </div>
+                    </div>
+                  </details>
+                </td>
+                <td><span class="badge info">{{ t('status.submitted') }}</span></td>
+                <td>{{ formatDate(o.order_date) }}</td>
+                <td>{{ o.lead_time_days }} {{ t('restocking.days') }}</td>
+                <td>{{ formatDate(o.expected_delivery) }}</td>
+                <td><strong>{{ currencySymbol }}{{ o.total_value.toLocaleString() }}</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-header">
           <h3 class="card-title">{{ t('orders.allOrders') }} ({{ orders.length }})</h3>
@@ -95,6 +137,7 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+    const restockingOrders = ref([])
 
     // Use shared filters
     const {
@@ -117,6 +160,13 @@ export default {
           const dateB = new Date(b.order_date)
           return dateA - dateB
         })
+
+        try {
+          restockingOrders.value = await api.getRestockingOrders()
+        } catch (e) {
+          console.error('Failed to load restocking orders:', e)
+          restockingOrders.value = []
+        }
       } catch (err) {
         error.value = 'Failed to load orders: ' + err.message
       } finally {
@@ -165,7 +215,8 @@ export default {
       formatDate,
       currencySymbol,
       translateProductName,
-      translateCustomerName
+      translateCustomerName,
+      restockingOrders
     }
   }
 }
